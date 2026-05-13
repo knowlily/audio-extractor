@@ -17,8 +17,8 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: 检查并安装 imageio-ffmpeg
-python -c "import imageio_ffmpeg" >nul 2>&1
+:: 检查并安装 imageio-ffmpeg（pip show 比 import 模块快得多）
+pip show imageio-ffmpeg >nul 2>&1
 if %errorlevel% neq 0 (
     echo   [安装] 正在自动安装 ffmpeg 组件...
     python -m pip install imageio-ffmpeg -q
@@ -34,10 +34,9 @@ echo   [启动] 正在打开界面...
 echo.
 
 :: 优先用 pythonw（无后台终端窗口），失败则用 python
-pythonw --version >nul 2>&1
-if %errorlevel% equ 0 (
+where /Q pythonw 2>nul && (
     start "" pythonw "%~dp0extract_audio_gui.py"
-) else (
+) || (
     start "" python "%~dp0extract_audio_gui.py"
 )
 

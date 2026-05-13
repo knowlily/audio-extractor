@@ -12,26 +12,42 @@ Usage:
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 
-def get_ffmpeg():
-    """Find ffmpeg binary: system PATH first, then imageio-ffmpeg's bundled copy."""
-    # Try system PATH first
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        return "ffmpeg"
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+_ffmpeg_cache = None
 
-    # Fall back to imageio-ffmpeg's bundled binary
+
+def get_ffmpeg():
+    """Return (exe_path, version_str) or exit if ffmpeg is not found. Cached after first call."""
+    global _ffmpeg_cache
+    if _ffmpeg_cache is not None:
+        return _ffmpeg_cache
+
+    # 1. Fast PATH lookup without spawning a subprocess
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            ver = subprocess.run(
+                [ffmpeg, "-version"], capture_output=True, text=True, timeout=10
+            ).stdout.splitlines()[0]
+            _ffmpeg_cache = (ffmpeg, ver)
+            return _ffmpeg_cache
+        except Exception:
+            pass
+
+    # 2. Fall back to imageio-ffmpeg's bundled binary
     try:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run([exe, "-version"], capture_output=True, check=True)
-        return exe
+        ver = subprocess.run(
+            [exe, "-version"], capture_output=True, text=True, timeout=10
+        ).stdout.splitlines()[0]
+        _ffmpeg_cache = (exe, ver)
+        return _ffmpeg_cache
     except Exception:
         pass
 
@@ -136,7 +152,7 @@ examples:
     if len(inputs) > 1 and args.output:
         sys.exit("--output can only be used with a single input file")
 
-    ffmpeg = None if args.dry_run else get_ffmpeg()
+    ffmpeg = None if args.dry_run else get_ffmpeg()[0]
     if not args.dry_run:
         print(f"ffmpeg: {ffmpeg}")
 

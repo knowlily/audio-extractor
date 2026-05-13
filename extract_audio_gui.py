@@ -2,6 +2,7 @@
 """从视频文件中提取音频 — 图形化操作界面"""
 
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -11,39 +12,58 @@ from tkinter import filedialog, messagebox, ttk
 
 
 def _install_imageio_ffmpeg():
-    """Try to auto-install imageio-ffmpeg via pip."""
-    import subprocess as sp
     try:
-        sp.run([sys.executable, "-m", "pip", "install", "imageio-ffmpeg", "-q"],
-               check=True, capture_output=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "imageio-ffmpeg", "-q"],
+                       check=True, capture_output=True)
         return True
     except Exception:
         return False
 
 
-def get_ffmpeg():
-    # 1. 系统 PATH 中的 ffmpeg
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-        return "ffmpeg"
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+_ffmpeg_cache = None
 
-    # 2. imageio-ffmpeg 提供的 ffmpeg
+
+def get_ffmpeg():
+    """Return (exe_path, version_str) or (None, None). Cached after first call."""
+    global _ffmpeg_cache
+    if _ffmpeg_cache is not None:
+        return _ffmpeg_cache
+
+    # 1. Fast PATH lookup — no subprocess spawn
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            ver = subprocess.run(
+                [ffmpeg, "-version"], capture_output=True, text=True, timeout=10
+            ).stdout.splitlines()[0]
+            _ffmpeg_cache = (ffmpeg, ver)
+            return _ffmpeg_cache
+        except Exception:
+            pass
+
+    # 2. imageio-ffmpeg bundled binary
     try:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run([exe, "-version"], capture_output=True, check=True)
-        return exe
+        ver = subprocess.run(
+            [exe, "-version"], capture_output=True, text=True, timeout=10
+        ).stdout.splitlines()[0]
+        _ffmpeg_cache = (exe, ver)
+        return _ffmpeg_cache
     except ImportError:
-        # 尝试自动安装
         if _install_imageio_ffmpeg():
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
-            return exe
-        return None
+            ver = subprocess.run(
+                [exe, "-version"], capture_output=True, text=True, timeout=10
+            ).stdout.splitlines()[0]
+            _ffmpeg_cache = (exe, ver)
+            return _ffmpeg_cache
     except Exception:
-        return None
+        pass
+
+    _ffmpeg_cache = (None, None)
+    return _ffmpeg_cache
 
 
 FORMATS = {
@@ -79,26 +99,30 @@ class AudioExtractorApp:
         self.files = []
         self.cancelled = False
         self.running = False
+        self.ffmpeg = None
 
         self._build_ui()
         self.file_label.config(text="正在准备环境...")
         self.status_label.config(text="检查 ffmpeg 组件...")
-        self.root.update()  # 先渲染界面，避免白屏等待
+        self.extract_btn.config(state="disabled")
 
-        self.ffmpeg = get_ffmpeg()
-        self._check_ffmpeg()
+        # Discover ffmpeg on a background thread so the UI appears instantly
+        threading.Thread(target=self._discover_ffmpeg, daemon=True).start()
 
-    def _check_ffmpeg(self):
-        if not self.ffmpeg:
-            self.status_label.config(
-                text="未找到 ffmpeg — 请手动运行: pip install imageio-ffmpeg", foreground="red")
-            self.extract_btn.config(state="disabled")
-            self.file_label.config(text="环境准备失败，请检查依赖后重启")
-        else:
-            ver = subprocess.run([self.ffmpeg, "-version"], capture_output=True,
-                                 text=True).stdout.split("\n")[0]
+    def _discover_ffmpeg(self):
+        exe, ver = get_ffmpeg()
+        self.root.after(0, lambda: self._on_ffmpeg_ready(exe, ver))
+
+    def _on_ffmpeg_ready(self, exe, ver):
+        self.ffmpeg = exe
+        if exe:
             self.status_label.config(text=ver)
             self.file_label.config(text="就绪 — 请添加视频文件或拖入文件")
+            self.extract_btn.config(state="normal")
+        else:
+            self.status_label.config(
+                text="未找到 ffmpeg — 请手动运行: pip install imageio-ffmpeg", foreground="red")
+            self.file_label.config(text="环境准备失败，请检查依赖后重启")
 
     # ------------------------------------------------------------------
     # 界面构建
@@ -250,6 +274,9 @@ class AudioExtractorApp:
     # 提取
     # ------------------------------------------------------------------
     def _start_extraction(self):
+        if not self.ffmpeg:
+            messagebox.showwarning("提示", "ffmpeg 尚未就绪，请稍候。")
+            return
         if not self.files:
             messagebox.showwarning("提示", "请先添加视频文件。")
             return
