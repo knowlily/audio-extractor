@@ -13,6 +13,12 @@ from tkinter import filedialog, messagebox, ttk
 from audio_utils import (FORMAT_NAMES, VIDEO_EXTENSIONS, build_ffmpeg_cmd,
                          EXT_TO_ENCODER, EXT_TO_MUXER, get_ffmpeg)
 
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
+
 # ---------------------------------------------------------------------------
 # settings persistence
 # ---------------------------------------------------------------------------
@@ -107,6 +113,7 @@ class AudioExtractorApp:
         self.ffmpeg = None
         self.current_process = None
         self.errors = []
+        self._dnd = _HAS_DND
 
         self._setup_styles()
         self._build_ui()
@@ -277,6 +284,19 @@ class AudioExtractorApp:
         self.tree.bind("<Button-3>", self._tree_context_menu)
         self.tree.bind("<Delete>", lambda e: self._remove_selected())
 
+        self._dnd_over = False
+        if self._dnd:
+            if hasattr(frame, 'drop_target_register'):
+                frame.drop_target_register(DND_FILES)
+                frame.dnd_bind("<<Drop>>", self._on_drop)
+                frame.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+                frame.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+            # Root as fallback: catches drops anywhere on the window
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._on_drop)
+            self.root.dnd_bind("<<DropEnter>>", self._on_drag_root_enter)
+            self.root.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+
     def _build_settings_card(self, parent):
         frame = ttk.LabelFrame(parent, text="  输出设置  ", padding=10)
         frame.pack(fill="x", pady=(0, 8))
@@ -373,6 +393,63 @@ class AudioExtractorApp:
     # ------------------------------------------------------------------
     # file list management
     # ------------------------------------------------------------------
+    def _parse_drop_paths(self, data):
+        """Split tkinterdnd2 drop data into a list of file paths."""
+        if not data:
+            return []
+        # tk splitlist handles Tcl list format: {C:/path/file.mp4} {D:/other.mkv}
+        try:
+            paths = self.root.tk.splitlist(data)
+        except Exception:
+            return []
+        # Fallback: also strip braces manually for paths that splitlist missed
+        cleaned = []
+        for p in paths:
+            p = p.strip()
+            if not p:
+                continue
+            if p.startswith("{") and p.endswith("}"):
+                p = p[1:-1]
+            cleaned.append(p)
+        return cleaned
+
+    def _on_drop(self, event):
+        self._dnd_highlight(False)
+        if self.running:
+            return
+        for path in self._parse_drop_paths(event.data):
+            pp = Path(path)
+            if pp.is_dir():
+                for root_dir, _, filenames in os.walk(pp):
+                    for fn in filenames:
+                        fp = Path(root_dir) / fn
+                        self._insert_file(fp)
+            else:
+                self._insert_file(pp)
+        self._update_file_count()
+
+    def _on_drag_enter(self, event):
+        if not self.running:
+            self._dnd_highlight(True)
+
+    def _on_drag_root_enter(self, event):
+        if not self.running:
+            self._dnd_highlight(True)
+
+    def _on_drag_leave(self, event):
+        self._dnd_highlight(False)
+
+    def _dnd_highlight(self, on):
+        self._dnd_over = on
+        if on:
+            self._file_count_label.configure(
+                text="释放以添加文件",
+                foreground=COLORS["primary"], font=("Segoe UI", 9, "bold"))
+        else:
+            n = len(self.files)
+            self._file_count_label.configure(
+                text=f"{n} 个文件" if n else "",
+                foreground=COLORS["text_light"], font=("Segoe UI", 9))
     def _add_files(self):
         exts = " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))
         paths = filedialog.askopenfilenames(
@@ -624,57 +701,11 @@ class AudioExtractorApp:
 # ---------------------------------------------------------------------------
 
 def main():
-    root = tk.Tk()
+    if _HAS_DND:
+        root = TkinterDnD.Tk()
+    else:
+        root = tk.Tk()
     app = AudioExtractorApp(root)
-
-    # Windows drag-drop support (WM_DROPFILES)
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        WS_EX_ACCEPTFILES = 0x10
-        GWL_EXSTYLE = -20
-
-        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-            ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | WS_EX_ACCEPTFILES)
-        ctypes.windll.shell32.DragAcceptFiles(hwnd, True)
-
-        WM_DROPFILES = 0x0233
-        old_proc = ctypes.windll.user32.GetWindowLongW(hwnd, -4)
-
-        WNDPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.c_void_p, ctypes.c_uint,
-            ctypes.c_wintypes.WPARAM, ctypes.c_wintypes.LPARAM,
-        )
-
-        @WNDPROC
-        def drop_proc(hwnd, msg, wparam, lparam):
-            if msg == WM_DROPFILES:
-                hdrop = wparam
-                count = ctypes.windll.shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-                buf = ctypes.create_unicode_buffer(32768)
-                for i in range(count):
-                    ctypes.windll.shell32.DragQueryFileW(hdrop, i, buf, 32768)
-                    filepath = buf.value
-                    if os.path.isdir(filepath):
-                        for root_dir, _, filenames in os.walk(filepath):
-                            for fn in filenames:
-                                fp = Path(root_dir) / fn
-                                if fp.suffix.lower() in VIDEO_EXTENSIONS:
-                                    app._insert_file(fp)
-                    elif Path(filepath).suffix.lower() in VIDEO_EXTENSIONS:
-                        app._insert_file(Path(filepath))
-                app._update_file_count()
-                ctypes.windll.shell32.DragFinish(hdrop)
-                return 0
-            return ctypes.windll.user32.CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
-
-        ctypes.windll.user32.SetWindowLongW(hwnd, -4, drop_proc)
-        app._old_proc = old_proc
-    except Exception:
-        pass
-
     root.mainloop()
 
 

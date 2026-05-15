@@ -31,7 +31,9 @@ echo   This may take 1-2 minutes...
 python -m PyInstaller --onefile --windowed ^
     --name "AudioExtractor" ^
     --collect-binaries imageio_ffmpeg ^
+    --collect-binaries tkinterdnd2 ^
     --hidden-import imageio_ffmpeg ^
+    --hidden-import tkinterdnd2 ^
     --hidden-import tkinter ^
     --add-data "audio_utils.py;." ^
     extract_audio_gui.py
