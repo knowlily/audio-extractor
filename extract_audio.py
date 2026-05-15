@@ -12,100 +12,30 @@ Usage:
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
+from glob import glob
 from pathlib import Path
 
-
-_ffmpeg_cache = None
-
-
-def get_ffmpeg():
-    """Return (exe_path, version_str) or exit if ffmpeg is not found. Cached after first call."""
-    global _ffmpeg_cache
-    if _ffmpeg_cache is not None:
-        return _ffmpeg_cache
-
-    # 1. Fast PATH lookup without spawning a subprocess
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        try:
-            ver = subprocess.run(
-                [ffmpeg, "-version"], capture_output=True, text=True, timeout=10
-            ).stdout.splitlines()[0]
-            _ffmpeg_cache = (ffmpeg, ver)
-            return _ffmpeg_cache
-        except Exception:
-            pass
-
-    # 2. Fall back to imageio-ffmpeg's bundled binary
-    try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        ver = subprocess.run(
-            [exe, "-version"], capture_output=True, text=True, timeout=10
-        ).stdout.splitlines()[0]
-        _ffmpeg_cache = (exe, ver)
-        return _ffmpeg_cache
-    except Exception:
-        pass
-
-    sys.exit(
-        "ffmpeg not found. Install it via:\n"
-        "  pip install imageio-ffmpeg\n"
-        "  or download from https://ffmpeg.org/download.html"
-    )
-
-
-EXT_TO_ENCODER = {
-    ".mp3":  "libmp3lame",
-    ".wav":  "pcm_s16le",
-    ".aac":  "aac",
-    ".m4a":  "aac",
-    ".ogg":  "libvorbis",
-    ".flac": "flac",
-    ".wma":  "wmav2",
-    ".opus": "libopus",
-}
-
-EXT_TO_MUXER = {
-    ".mp3":  "mp3",
-    ".wav":  "wav",
-    ".aac":  "adts",
-    ".m4a":  "ipod",
-    ".ogg":  "ogg",
-    ".flac": "flac",
-    ".wma":  "asf",
-    ".opus": "ogg",
-}
+from audio_utils import (build_ffmpeg_cmd, EXT_TO_ENCODER, EXT_TO_MUXER,
+                         get_ffmpeg)
 
 
 def extract_audio(input_path, output_path, fmt, bitrate, sample_rate, channels,
-                  start=None, end=None, ffmpeg="ffmpeg"):
-    """Extract audio from a video file."""
+                  start=None, end=None, ffmpeg="ffmpeg", dry_run=False):
     ext = fmt or Path(output_path).suffix.lower()
     encoder = EXT_TO_ENCODER.get(ext, "libmp3lame")
     muxer = EXT_TO_MUXER.get(ext)
 
-    cmd = [ffmpeg, "-y", "-i", str(input_path), "-vn"]
-    cmd += ["-c:a", encoder]
+    cmd = build_ffmpeg_cmd(
+        ffmpeg, input_path, output_path, encoder,
+        bitrate=bitrate, sample_rate=sample_rate, channels=channels,
+        start=start, end=end, muxer=muxer,
+    )
 
-    if bitrate:
-        cmd += ["-b:a", bitrate]
-    if sample_rate:
-        cmd += ["-ar", str(sample_rate)]
-    if channels:
-        cmd += ["-ac", str(channels)]
-    if start:
-        cmd += ["-ss", start]
-    if end:
-        cmd += ["-to", end]
-
-    if muxer:
-        cmd += ["-f", muxer]
-
-    cmd.append(str(output_path))
+    if dry_run:
+        print(f"  [dry-run] {' '.join(cmd)}")
+        return
 
     try:
         subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
@@ -145,15 +75,23 @@ examples:
     # Expand glob patterns on platforms that don't auto-expand (Windows)
     inputs = []
     for pattern in args.input:
-        from glob import glob
         matches = glob(pattern)
         inputs.extend(matches if matches else [pattern])
 
     if len(inputs) > 1 and args.output:
         sys.exit("--output can only be used with a single input file")
 
-    ffmpeg = None if args.dry_run else get_ffmpeg()[0]
-    if not args.dry_run:
+    if args.dry_run:
+        ffmpeg = "ffmpeg"
+    else:
+        exe, _ = get_ffmpeg()
+        if not exe:
+            sys.exit(
+                "ffmpeg not found. Install it via:\n"
+                "  pip install imageio-ffmpeg\n"
+                "  or download from https://ffmpeg.org/download.html"
+            )
+        ffmpeg = exe
         print(f"ffmpeg: {ffmpeg}")
 
     for path in inputs:
@@ -166,9 +104,13 @@ examples:
             out_path = Path(args.output)
         else:
             suffix = f".{args.format}"
-            out_path = Path(args.output_dir) / (in_path.stem + suffix) if args.output_dir else in_path.with_suffix(suffix)
+            out_path = (Path(args.output_dir) / (in_path.stem + suffix)
+                        if args.output_dir else in_path.with_suffix(suffix))
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if out_path.exists() and not args.dry_run:
+            print(f"  Warning: overwriting existing file — {out_path}", file=sys.stderr)
 
         print(f"Extracting: {in_path.name}")
         extract_audio(
@@ -177,9 +119,10 @@ examples:
             bitrate=args.bitrate,
             sample_rate=args.sample_rate,
             channels=args.channels,
-            start=getattr(args, 'ss', None),
-            end=getattr(args, 'to', None),
-            ffmpeg=ffmpeg or "ffmpeg",
+            start=args.ss,
+            end=args.to,
+            ffmpeg=ffmpeg,
+            dry_run=args.dry_run,
         )
 
 

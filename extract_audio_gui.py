@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """从视频文件中提取音频 — 图形化操作界面"""
 
+import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -10,105 +10,187 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from audio_utils import (FORMAT_NAMES, VIDEO_EXTENSIONS, build_ffmpeg_cmd,
+                         EXT_TO_ENCODER, EXT_TO_MUXER, get_ffmpeg)
 
-def _install_imageio_ffmpeg():
+# ---------------------------------------------------------------------------
+# settings persistence
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path.home() / ".audio_extractor_config.json"
+
+DEFAULTS = {
+    "format": "MP3", "bitrate": "192k", "sample_rate": "原始",
+    "channels": "立体声", "output_dir": "",
+}
+
+
+def load_settings():
     try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "imageio-ffmpeg", "-q"],
-                       check=True, capture_output=True)
-        return True
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {**DEFAULTS, **{k: v for k, v in data.items() if k in DEFAULTS}}
     except Exception:
-        return False
+        return dict(DEFAULTS)
 
 
-_ffmpeg_cache = None
-
-
-def get_ffmpeg():
-    """Return (exe_path, version_str) or (None, None). Cached after first call."""
-    global _ffmpeg_cache
-    if _ffmpeg_cache is not None:
-        return _ffmpeg_cache
-
-    # 1. Fast PATH lookup — no subprocess spawn
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        try:
-            ver = subprocess.run(
-                [ffmpeg, "-version"], capture_output=True, text=True, timeout=10
-            ).stdout.splitlines()[0]
-            _ffmpeg_cache = (ffmpeg, ver)
-            return _ffmpeg_cache
-        except Exception:
-            pass
-
-    # 2. imageio-ffmpeg bundled binary
+def save_settings(settings):
     try:
-        import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        ver = subprocess.run(
-            [exe, "-version"], capture_output=True, text=True, timeout=10
-        ).stdout.splitlines()[0]
-        _ffmpeg_cache = (exe, ver)
-        return _ffmpeg_cache
-    except ImportError:
-        if _install_imageio_ffmpeg():
-            import imageio_ffmpeg
-            exe = imageio_ffmpeg.get_ffmpeg_exe()
-            ver = subprocess.run(
-                [exe, "-version"], capture_output=True, text=True, timeout=10
-            ).stdout.splitlines()[0]
-            _ffmpeg_cache = (exe, ver)
-            return _ffmpeg_cache
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
-    _ffmpeg_cache = (None, None)
-    return _ffmpeg_cache
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def open_folder(path):
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        else:
+            subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", path], check=True)
+    except Exception:
+        pass
 
 
-FORMATS = {
-    "MP3":  ".mp3",
-    "WAV":  ".wav",
-    "AAC":  ".aac",
-    "M4A":  ".m4a",
-    "OGG":  ".ogg",
-    "FLAC": ".flac",
-    "WMA":  ".wma",
-    "Opus": ".opus",
+def _parse_timestamp(line, marker):
+    idx = line.find(marker)
+    if idx == -1:
+        return None
+    try:
+        rest = line[idx + len(marker):].strip()
+        ts = rest.split(",")[0].split()[0]
+        h, m, s = ts.split(":")
+        return float(h) * 3600 + float(m) * 60 + float(s)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# color scheme
+# ---------------------------------------------------------------------------
+
+COLORS = {
+    "bg":           "#f0f2f5",
+    "card":         "#ffffff",
+    "header":       "#2c3e50",
+    "header_text":  "#ffffff",
+    "primary":      "#3498db",
+    "primary_hover":"#2980b9",
+    "success":      "#27ae60",
+    "danger":       "#e74c3c",
+    "warning":      "#f39c12",
+    "text":         "#2c3e50",
+    "text_light":   "#7f8c8d",
+    "border":       "#dce1e8",
+    "row_alt":      "#f8f9fa",
 }
 
-ENCODER = {
-    ".mp3": "libmp3lame", ".wav": "pcm_s16le", ".aac": "aac",
-    ".m4a": "aac", ".ogg": "libvorbis", ".flac": "flac",
-    ".wma": "wmav2", ".opus": "libopus",
-}
-
-VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".wmv",
-    ".m4v", ".ts", ".m2ts", ".3gp", ".ogv", ".divx",
-}
-
+# ---------------------------------------------------------------------------
+# main application
+# ---------------------------------------------------------------------------
 
 class AudioExtractorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("音频提取工具")
-        self.root.geometry("700x540")
-        self.root.minsize(580, 440)
+        self.root.geometry("740x680")
+        self.root.minsize(600, 500)
+        self.root.configure(bg=COLORS["bg"])
 
         self.files = []
         self.cancelled = False
         self.running = False
         self.ffmpeg = None
+        self.current_process = None
+        self.errors = []
 
+        self._setup_styles()
         self._build_ui()
-        self.file_label.config(text="正在准备环境...")
-        self.status_label.config(text="检查 ffmpeg 组件...")
+        self._load_settings()
+
+        self.status_text.set("检查 ffmpeg 组件...")
         self.extract_btn.config(state="disabled")
 
-        # Discover ffmpeg on a background thread so the UI appears instantly
         threading.Thread(target=self._discover_ffmpeg, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # ttk styles
+    # ------------------------------------------------------------------
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure(".", font=("Segoe UI", 9), background=COLORS["bg"])
+        style.configure("TFrame", background=COLORS["bg"])
+        style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["text"])
+        style.configure("TLabelframe", background=COLORS["bg"], foreground=COLORS["text"])
+        style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"),
+                        foreground=COLORS["header"], background=COLORS["bg"])
+
+        # Cards: white bg frame
+        style.configure("Card.TFrame", background=COLORS["card"])
+
+        # Header
+        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"),
+                        foreground=COLORS["header"], background=COLORS["bg"])
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 9),
+                        foreground=COLORS["text_light"], background=COLORS["bg"])
+
+        # Buttons
+        style.configure("TButton", font=("Segoe UI", 9), padding=(12, 5))
+        style.configure("Primary.TButton", background=COLORS["primary"])
+        style.map("Primary.TButton",
+                  background=[("active", COLORS["primary_hover"]),
+                              ("disabled", "#bdc3c7")])
+
+        style.configure("Toolbar.TButton", font=("Segoe UI", 9), padding=(8, 4))
+
+        # Treeview
+        style.configure("Treeview", font=("Segoe UI", 9), rowheight=26,
+                        background=COLORS["card"], fieldbackground=COLORS["card"])
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"),
+                        background=COLORS["bg"], foreground=COLORS["text"])
+        style.map("Treeview", background=[("selected", COLORS["primary"])])
+
+        # Progress bar
+        style.configure("TProgressbar", thickness=10, troughcolor=COLORS["border"],
+                        background=COLORS["primary"])
+
+        # Status bar
+        style.configure("Status.TLabel", font=("Segoe UI", 8),
+                        foreground=COLORS["text_light"], background=COLORS["bg"])
+
+        # Separator
+        style.configure("TEntry", fieldbackground=COLORS["card"])
+
+    # ------------------------------------------------------------------
+    # settings
+    # ------------------------------------------------------------------
+    def _load_settings(self):
+        s = load_settings()
+        self.format_var.set(s["format"])
+        self.bitrate_var.set(s["bitrate"])
+        self.rate_var.set(s["sample_rate"])
+        self.ch_var.set(s["channels"])
+        if s["output_dir"]:
+            self.outdir_var.set(s["output_dir"])
+
+    def _persist_settings(self):
+        save_settings({
+            "format": self.format_var.get(),
+            "bitrate": self.bitrate_var.get(),
+            "sample_rate": self.rate_var.get(),
+            "channels": self.ch_var.get(),
+            "output_dir": self.outdir_var.get(),
+        })
+
+    # ------------------------------------------------------------------
+    # ffmpeg discovery
+    # ------------------------------------------------------------------
     def _discover_ffmpeg(self):
         exe, ver = get_ffmpeg()
         self.root.after(0, lambda: self._on_ffmpeg_ready(exe, ver))
@@ -116,151 +198,230 @@ class AudioExtractorApp:
     def _on_ffmpeg_ready(self, exe, ver):
         self.ffmpeg = exe
         if exe:
-            self.status_label.config(text=ver)
-            self.file_label.config(text="就绪 — 请添加视频文件或拖入文件")
+            self.status_text.set(ver)
+            self.status_label.configure(foreground=COLORS["success"])
             self.extract_btn.config(state="normal")
         else:
-            self.status_label.config(
-                text="未找到 ffmpeg — 请手动运行: pip install imageio-ffmpeg", foreground="red")
-            self.file_label.config(text="环境准备失败，请检查依赖后重启")
+            self.status_text.set("ffmpeg 未找到 — 请运行 pip install imageio-ffmpeg")
+            self.status_label.configure(foreground=COLORS["danger"])
 
     # ------------------------------------------------------------------
-    # 界面构建
+    # UI building
     # ------------------------------------------------------------------
     def _build_ui(self):
-        style = ttk.Style()
-        style.theme_use("clam")
+        # --- bottom bar (pack first so it gets reserved space) ---
+        self._build_bottom_bar()
 
-        # --- 视频文件列表 ---
-        file_frame = ttk.LabelFrame(self.root, text="视频文件", padding=5)
-        file_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        # --- header ---
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", side="top")
+        header_inner = tk.Frame(header, bg=COLORS["header"], padx=20, pady=14)
+        header_inner.pack(fill="x")
+        tk.Label(header_inner, text="音频提取工具",
+                 font=("Segoe UI", 16, "bold"),
+                 fg=COLORS["header_text"], bg=COLORS["header"]).pack(anchor="w")
+        tk.Label(header_inner, text="从视频文件中提取音频 · 支持拖放与批量处理",
+                 font=("Segoe UI", 9),
+                 fg="#b0bec5", bg=COLORS["header"]).pack(anchor="w")
 
-        toolbar = ttk.Frame(file_frame)
-        toolbar.pack(fill="x", pady=(0, 4))
-        ttk.Button(toolbar, text="添加文件", command=self._add_files).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="移除选中", command=self._remove_selected).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="清空列表", command=self._clear_all).pack(side="left", padx=2)
+        # --- body (packed last so it fills remaining space) ---
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True, padx=12, pady=(12, 0))
+
+        # Card 1: video file list
+        self._build_file_card(body)
+
+        # Card 2: output settings
+        self._build_settings_card(body)
+
+        # Card 3: progress
+        self._build_progress_card(body)
+
+    def _build_file_card(self, parent):
+        frame = ttk.LabelFrame(parent, text="  视频文件  ", padding=10)
+        frame.pack(fill="both", expand=True, pady=(0, 8))
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", pady=(0, 8))
+        self.add_btn = ttk.Button(toolbar, text="＋ 添加文件",
+                                  command=self._add_files, style="Toolbar.TButton")
+        self.add_btn.pack(side="left", padx=(0, 4))
+        self.remove_btn = ttk.Button(toolbar, text="－ 移除选中",
+                                     command=self._remove_selected, style="Toolbar.TButton")
+        self.remove_btn.pack(side="left", padx=4)
+        self.clear_btn = ttk.Button(toolbar, text="清空列表",
+                                    command=self._clear_all, style="Toolbar.TButton")
+        self.clear_btn.pack(side="left", padx=4)
+
+        file_count = ttk.Label(toolbar, text="", foreground=COLORS["text_light"])
+        file_count.pack(side="right")
+        self._file_count_label = file_count
 
         cols = ("#", "filename", "path")
-        self.tree = ttk.Treeview(file_frame, columns=cols, show="headings",
-                                 selectmode="extended", height=8)
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings",
+                                 selectmode="extended", height=5)
         self.tree.heading("#", text="#")
         self.tree.heading("filename", text="文件名")
-        self.tree.heading("path", text="路径")
+        self.tree.heading("path", text="完整路径")
         self.tree.column("#", width=35, anchor="center")
         self.tree.column("filename", width=200)
-        self.tree.column("path", width=400)
+        self.tree.column("path", width=420)
         self.tree.pack(fill="both", expand=True, side="left")
 
-        scrollbar = ttk.Scrollbar(file_frame, orient="vertical", command=self.tree.yview)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         scrollbar.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=scrollbar.set)
 
-        # 右键菜单
         self.tree_menu = tk.Menu(self.root, tearoff=0)
         self.tree_menu.add_command(label="移除", command=self._remove_selected)
         self.tree.bind("<Button-3>", self._tree_context_menu)
         self.tree.bind("<Delete>", lambda e: self._remove_selected())
 
-        # --- 输出设置 ---
-        options_frame = ttk.LabelFrame(self.root, text="输出设置", padding=8)
-        options_frame.pack(fill="x", padx=8, pady=4)
+    def _build_settings_card(self, parent):
+        frame = ttk.LabelFrame(parent, text="  输出设置  ", padding=10)
+        frame.pack(fill="x", pady=(0, 8))
 
-        row1 = ttk.Frame(options_frame)
-        row1.pack(fill="x", pady=2)
-        ttk.Label(row1, text="格式:").pack(side="left")
+        # Row 0: format / bitrate / sample rate / channels
+        r0 = ttk.Frame(frame)
+        r0.pack(fill="x", pady=(0, 6))
+        for i in range(4):
+            r0.columnconfigure(i, weight=1)
+
         self.format_var = tk.StringVar(value="MP3")
-        fmt_combo = ttk.Combobox(row1, textvariable=self.format_var,
-                                 values=list(FORMATS.keys()), state="readonly", width=6)
-        fmt_combo.pack(side="left", padx=4)
-
-        ttk.Label(row1, text="比特率:").pack(side="left", padx=(20, 0))
         self.bitrate_var = tk.StringVar(value="192k")
-        br_combo = ttk.Combobox(row1, textvariable=self.bitrate_var,
-                                values=["64k", "96k", "128k", "160k", "192k", "256k", "320k"],
-                                state="readonly", width=6)
-        br_combo.pack(side="left", padx=4)
-
-        ttk.Label(row1, text="采样率:").pack(side="left", padx=(20, 0))
         self.rate_var = tk.StringVar(value="原始")
-        rate_combo = ttk.Combobox(row1, textvariable=self.rate_var,
-                                  values=["原始", "44100", "48000", "22050", "16000"],
-                                  state="readonly", width=7)
-        rate_combo.pack(side="left", padx=4)
-
-        ttk.Label(row1, text="声道:").pack(side="left", padx=(20, 0))
         self.ch_var = tk.StringVar(value="立体声")
-        ch_combo = ttk.Combobox(row1, textvariable=self.ch_var,
-                                values=["立体声", "单声道"], state="readonly", width=6)
-        ch_combo.pack(side="left", padx=4)
 
-        # 输出目录
-        row2 = ttk.Frame(options_frame)
-        row2.pack(fill="x", pady=(6, 2))
-        ttk.Label(row2, text="输出目录:").pack(side="left")
+        self._labeled_combo(r0, "格式", self.format_var,
+                            list(FORMAT_NAMES.keys()), 0, 6)
+        self._labeled_combo(r0, "比特率", self.bitrate_var,
+                            ["64k", "96k", "128k", "160k", "192k", "256k", "320k"], 1, 6)
+        self._labeled_combo(r0, "采样率", self.rate_var,
+                            ["原始", "44100", "48000", "22050", "16000"], 2, 8)
+        self._labeled_combo(r0, "声道", self.ch_var,
+                            ["立体声", "单声道"], 3, 6)
+
+        # Row 1: time range
+        r1 = ttk.Frame(frame)
+        r1.pack(fill="x", pady=(0, 6))
+        ttk.Label(r1, text="起始:").pack(side="left")
+        self.start_var = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.start_var, width=10, font=("Segoe UI", 9)).pack(side="left", padx=4)
+        ttk.Label(r1, text="(可选, 如 01:30)",
+                  foreground=COLORS["text_light"], font=("Segoe UI", 8)).pack(side="left", padx=(0, 16))
+        ttk.Label(r1, text="结束:").pack(side="left")
+        self.end_var = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.end_var, width=10, font=("Segoe UI", 9)).pack(side="left", padx=4)
+        ttk.Label(r1, text="(可选, 如 03:00)",
+                  foreground=COLORS["text_light"], font=("Segoe UI", 8)).pack(side="left")
+        self.meta_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(r1, text="复制元数据", variable=self.meta_var).pack(side="right")
+
+        # Row 2: output directory
+        r2 = ttk.Frame(frame)
+        r2.pack(fill="x")
+        ttk.Label(r2, text="输出:").pack(side="left")
         self.outdir_var = tk.StringVar(value=os.getcwd())
-        ttk.Entry(row2, textvariable=self.outdir_var).pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(row2, text="浏览...", command=self._browse_outdir).pack(side="left")
+        ttk.Entry(r2, textvariable=self.outdir_var, font=("Segoe UI", 9)).pack(
+            side="left", fill="x", expand=True, padx=4)
+        ttk.Button(r2, text="浏览", command=self._browse_outdir).pack(side="left", padx=2)
+        ttk.Button(r2, text="打开", command=self._open_output).pack(side="left")
 
-        # --- 进度 ---
-        progress_frame = ttk.LabelFrame(self.root, text="进度", padding=8)
-        progress_frame.pack(fill="x", padx=8, pady=4)
+    def _labeled_combo(self, parent, label, var, values, col, width):
+        grp = ttk.Frame(parent)
+        grp.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 8))
+        ttk.Label(grp, text=label + ":", foreground=COLORS["text_light"],
+                  font=("Segoe UI", 8)).pack(anchor="w")
+        cb = ttk.Combobox(grp, textvariable=var, values=values,
+                          state="readonly", width=width)
+        cb.pack(fill="x")
 
-        self.file_label = ttk.Label(progress_frame, text="就绪")
-        self.file_label.pack(anchor="w")
+    def _build_progress_card(self, parent):
+        frame = ttk.LabelFrame(parent, text="  进度  ", padding=10)
+        frame.pack(fill="x", pady=(0, 8))
 
-        self.progress = ttk.Progressbar(progress_frame, mode="determinate")
-        self.progress.pack(fill="x", pady=4)
+        self.file_label = ttk.Label(frame, text="就绪 — 请添加视频文件或拖入文件",
+                                    font=("Segoe UI", 9))
+        self.file_label.pack(anchor="w", pady=(0, 6))
 
-        # --- 底部 ---
-        bottom = ttk.Frame(self.root, padding=8)
-        bottom.pack(fill="x")
+        self.progress = ttk.Progressbar(frame, mode="determinate")
+        self.progress.pack(fill="x")
 
-        self.status_label = ttk.Label(bottom, text="初始化中...", foreground="gray")
+    def _build_bottom_bar(self):
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x", side="bottom")
+
+        border = tk.Frame(bottom, height=1, bg=COLORS["border"])
+        border.pack(fill="x")
+
+        inner = tk.Frame(bottom, bg=COLORS["card"], padx=16, pady=10)
+        inner.pack(fill="x")
+
+        self.status_text = tk.StringVar(value="初始化中...")
+        self.status_label = tk.Label(inner, textvariable=self.status_text,
+                                     font=("Segoe UI", 8),
+                                     fg=COLORS["text_light"], bg=COLORS["card"],
+                                     anchor="w")
         self.status_label.pack(side="left")
 
-        self.extract_btn = ttk.Button(bottom, text="提取音频", command=self._start_extraction)
+        self.cancel_btn = ttk.Button(inner, text="取消", command=self._cancel, state="disabled")
+        self.cancel_btn.pack(side="right", padx=(4, 0))
+        self.extract_btn = ttk.Button(inner, text="提取音频",
+                                      command=self._start_extraction, style="Primary.TButton")
         self.extract_btn.pack(side="right")
-        self.cancel_btn = ttk.Button(bottom, text="取消", command=self._cancel, state="disabled")
-        self.cancel_btn.pack(side="right", padx=4)
 
     # ------------------------------------------------------------------
-    # 文件列表管理
+    # file list management
     # ------------------------------------------------------------------
     def _add_files(self):
+        exts = " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))
         paths = filedialog.askopenfilenames(
             title="选择视频文件",
-            filetypes=[
-                ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.webm *.wmv *.m4v *.ts *.m2ts *.3gp *.ogv *.divx"),
-                ("所有文件", "*.*"),
-            ],
+            filetypes=[("视频文件", exts), ("所有文件", "*.*")],
         )
         for p in paths:
-            self._insert_file(Path(p))
+            pp = Path(p)
+            if pp.suffix.lower() not in VIDEO_EXTENSIONS:
+                if not messagebox.askyesno("确认", f"{pp.name}\n\n不是常见的视频格式，仍然添加吗？"):
+                    continue
+            self._insert_file(pp)
+        self._update_file_count()
 
     def _insert_file(self, p: Path):
-        if p in self.files:
+        rp = p.resolve()
+        if any(rp == existing.resolve() for existing in self.files):
             return
         self.files.append(p)
         idx = len(self.files)
         self.tree.insert("", "end", iid=str(idx), values=(idx, p.name, str(p.parent)))
 
     def _remove_selected(self):
-        for iid in reversed(self.tree.selection()):
+        indices = []
+        for iid in self.tree.selection():
             idx = int(iid) - 1
             if 0 <= idx < len(self.files):
-                self.files.pop(idx)
-            self.tree.delete(iid)
+                indices.append(idx)
+        for idx in sorted(indices, reverse=True):
+            self.files.pop(idx)
         self._reindex()
+        self._update_file_count()
 
     def _clear_all(self):
-        self.files.clear()
-        self.tree.delete(*self.tree.get_children())
+        if not self.files:
+            return
+        if messagebox.askyesno("确认", f"确定要清空全部 {len(self.files)} 个文件吗？"):
+            self.files.clear()
+            self.tree.delete(*self.tree.get_children())
+            self._update_file_count()
 
     def _reindex(self):
         self.tree.delete(*self.tree.get_children())
         for i, p in enumerate(self.files, 1):
             self.tree.insert("", "end", iid=str(i), values=(i, p.name, str(p.parent)))
+
+    def _update_file_count(self):
+        n = len(self.files)
+        self._file_count_label.config(text=f"{n} 个文件" if n else "")
 
     def _tree_context_menu(self, event):
         self.tree_menu.post(event.x_root, event.y_root)
@@ -270,8 +431,15 @@ class AudioExtractorApp:
         if d:
             self.outdir_var.set(d)
 
+    def _open_output(self):
+        d = self.outdir_var.get()
+        if d and os.path.isdir(d):
+            open_folder(d)
+        else:
+            messagebox.showwarning("提示", "输出目录不存在。")
+
     # ------------------------------------------------------------------
-    # 提取
+    # extraction with live progress and cancel support
     # ------------------------------------------------------------------
     def _start_extraction(self):
         if not self.ffmpeg:
@@ -283,83 +451,183 @@ class AudioExtractorApp:
         if self.running:
             return
 
+        self._persist_settings()
+
+        params = {
+            "files": list(self.files),
+            "ffmpeg": self.ffmpeg,
+            "fmt_key": self.format_var.get(),
+            "bitrate": self.bitrate_var.get(),
+            "rate": self.rate_var.get(),
+            "ch": self.ch_var.get(),
+            "start": self.start_var.get().strip() or None,
+            "end": self.end_var.get().strip() or None,
+            "metadata": self.meta_var.get(),
+            "outdir": self.outdir_var.get(),
+        }
+
         self.running = True
         self.cancelled = False
-        self.extract_btn.config(state="disabled")
-        self.cancel_btn.config(state="normal")
-        self.progress["maximum"] = len(self.files)
-        self.progress["value"] = 0
+        self.errors.clear()
+        self._set_ui_state(extracting=True)
 
-        threading.Thread(target=self._extract_all, daemon=True).start()
+        threading.Thread(target=self._extract_all, args=(params,), daemon=True).start()
 
-    def _extract_all(self):
-        fmt_key = self.format_var.get()
-        ext = FORMATS[fmt_key]
-        encoder = ENCODER[ext]
+    def _set_ui_state(self, extracting):
+        state = "disabled" if extracting else "normal"
+        self.add_btn.config(state=state)
+        self.remove_btn.config(state=state)
+        self.clear_btn.config(state=state)
+        self.extract_btn.config(state="disabled" if extracting else "normal")
+        self.cancel_btn.config(state="normal" if extracting else "disabled")
+
+    def _extract_all(self, params):
+        files = params["files"]
+        ext = FORMAT_NAMES[params["fmt_key"]]
+        encoder = EXT_TO_ENCODER[ext]
+        muxer = EXT_TO_MUXER.get(ext)
+        total = len(files)
+
+        self.root.after(0, lambda: self.progress.configure(maximum=total, value=0))
 
         success = 0
-        total = len(self.files)
-
-        for i, in_path in enumerate(self.files):
+        for i, in_path in enumerate(files):
             if self.cancelled:
                 break
 
-            out_path = Path(self.outdir_var.get()) / (in_path.stem + ext)
-            self._set_file_label(f"({i+1}/{total}) {in_path.name}")
+            out_path = Path(params["outdir"]) / (in_path.stem + ext)
+            self.root.after(0, lambda t=f"({i+1}/{total}) {in_path.name}":
+                            self.file_label.config(text=t))
 
-            cmd = [self.ffmpeg, "-y", "-i", str(in_path), "-vn", "-c:a", encoder,
-                   "-b:a", self.bitrate_var.get()]
+            if out_path.exists():
+                overwrite = [False]
+                event = threading.Event()
 
-            rate = self.rate_var.get()
-            if rate != "原始":
-                cmd += ["-ar", rate]
+                def ask():
+                    ow = messagebox.askyesno(
+                        "文件已存在",
+                        f"{out_path.name}\n\n文件已存在，是否覆盖？")
+                    overwrite[0] = ow
+                    event.set()
 
-            ch = self.ch_var.get()
-            if ch == "单声道":
-                cmd += ["-ac", "1"]
+                self.root.after(0, ask)
+                event.wait()
+                if not overwrite[0]:
+                    self.root.after(0, lambda v=i+1: self.progress.configure(value=v))
+                    continue
 
-            cmd.append(str(out_path))
+            cmd = build_ffmpeg_cmd(
+                params["ffmpeg"], in_path, out_path, encoder,
+                bitrate=params["bitrate"],
+                sample_rate=None if params["rate"] == "原始" else params["rate"],
+                channels=1 if params["ch"] == "单声道" else None,
+                start=params["start"],
+                end=params["end"],
+                muxer=muxer,
+                metadata=params["metadata"],
+            )
 
-            try:
-                subprocess.run(cmd, check=True, capture_output=True)
+            ok, err = self._run_one(cmd, i + 1, total)
+            if ok:
                 success += 1
-            except subprocess.CalledProcessError as e:
-                self.root.after(0, lambda err=e, f=in_path.name:
-                    self._log_error(f, err.stderr.decode(errors="replace").strip()))
-
-            self.root.after(0, lambda v=i+1: self.progress.configure(value=v))
+            elif err:
+                self.errors.append((in_path.name, err))
+                self.root.after(0, lambda v=i+1: self.progress.configure(value=v))
+            else:
+                self.root.after(0, lambda v=i+1: self.progress.configure(value=v))
 
         if self.cancelled:
             msg = f"已取消。成功提取 {success}/{total} 个文件。"
         else:
-            msg = f"完成！成功提取 {success}/{total} 个文件。"
-        self.root.after(0, lambda: self._finish(msg))
+            msg = f"完成。成功提取 {success}/{total} 个文件。"
 
-    def _set_file_label(self, text):
-        self.root.after(0, lambda: self.file_label.config(text=text))
+        if self.errors:
+            msg += f"\n\n{len(self.errors)} 个文件提取失败："
+            for name, err in self.errors[:10]:
+                msg += f"\n  - {name}: {err[:120]}"
+            if len(self.errors) > 10:
+                msg += f"\n  ... 及其他 {len(self.errors) - 10} 个"
 
+        final_msg = msg
+        self.root.after(0, lambda: self._finish(final_msg))
+
+    def _run_one(self, cmd, file_num, total):
+        try:
+            p = subprocess.Popen(
+                cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                text=True, errors="replace",
+            )
+            self.current_process = p
+        except Exception as e:
+            return False, str(e)
+
+        duration = None
+        stderr_lines = []
+
+        for line in p.stderr:
+            if self.cancelled:
+                self._terminate(p)
+                return False, None
+
+            stderr_lines.append(line)
+
+            if duration is None:
+                duration = _parse_timestamp(line, "Duration:")
+
+            t = _parse_timestamp(line, "time=")
+            if t is not None:
+                pct = min(100, int(t / duration * 100)) if duration else 0
+                status = f"({file_num}/{total}) {pct}%"
+                self.root.after(0, lambda s=status: self.file_label.config(text=s))
+
+        ret = p.wait()
+        self.current_process = None
+
+        if ret == 0:
+            return True, None
+        else:
+            err_lines = [l.strip() for l in stderr_lines if l.strip()]
+            err = err_lines[-3:] if len(err_lines) >= 3 else err_lines
+            return False, "\n".join(err)
+
+    def _terminate(self, p):
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+        except Exception:
+            pass
+        self.current_process = None
+
+    # ------------------------------------------------------------------
+    # UI callbacks (main thread only)
+    # ------------------------------------------------------------------
     def _finish(self, msg):
         self.running = False
+        self.current_process = None
         self.file_label.config(text=msg)
-        self.extract_btn.config(state="normal")
-        self.cancel_btn.config(state="disabled")
+        self._set_ui_state(extracting=False)
         messagebox.showinfo("完成", msg)
 
     def _cancel(self):
         self.cancelled = True
         self.file_label.config(text="正在取消...")
+        if self.current_process:
+            self._terminate(self.current_process)
 
-    def _log_error(self, filename, stderr):
-        lines = [l for l in stderr.splitlines() if l.strip()]
-        err_msg = lines[-1] if lines else stderr[:200]
-        messagebox.showerror("错误", f"提取失败: {filename}\n\n{err_msg}")
 
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
 
 def main():
     root = tk.Tk()
     app = AudioExtractorApp(root)
 
-    # Windows 拖放支持 (WM_DROPFILES)
+    # Windows drag-drop support (WM_DROPFILES)
     try:
         import ctypes
         from ctypes import wintypes
@@ -385,12 +653,19 @@ def main():
             if msg == WM_DROPFILES:
                 hdrop = wparam
                 count = ctypes.windll.shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-                buf = ctypes.create_unicode_buffer(260)
+                buf = ctypes.create_unicode_buffer(32768)
                 for i in range(count):
-                    ctypes.windll.shell32.DragQueryFileW(hdrop, i, buf, 260)
+                    ctypes.windll.shell32.DragQueryFileW(hdrop, i, buf, 32768)
                     filepath = buf.value
-                    if Path(filepath).suffix.lower() in VIDEO_EXTENSIONS:
+                    if os.path.isdir(filepath):
+                        for root_dir, _, filenames in os.walk(filepath):
+                            for fn in filenames:
+                                fp = Path(root_dir) / fn
+                                if fp.suffix.lower() in VIDEO_EXTENSIONS:
+                                    app._insert_file(fp)
+                    elif Path(filepath).suffix.lower() in VIDEO_EXTENSIONS:
                         app._insert_file(Path(filepath))
+                app._update_file_count()
                 ctypes.windll.shell32.DragFinish(hdrop)
                 return 0
             return ctypes.windll.user32.CallWindowProcW(old_proc, hwnd, msg, wparam, lparam)
