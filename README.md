@@ -4,7 +4,13 @@
 
 ## 快速开始
 
-### 方式一：图形界面（推荐）
+### 方式一：独立 EXE（无需 Python）
+
+下载 `AudioExtractor.exe`，双击运行。无需安装 Python 或任何依赖，单个文件即可使用。
+
+> 如需自行打包：安装 PyInstaller 后运行 `build_exe.bat`，生成的 exe 在 `dist/` 目录。
+
+### 方式二：图形界面（需要 Python）
 
 双击 `启动提取工具.bat`，自动准备环境并打开界面：
 
@@ -12,7 +18,7 @@
 - 选择输出格式、比特率、采样率、声道
 - 点击"提取音频"，支持批量处理
 
-### 方式二：命令行
+### 方式三：命令行
 
 ```bash
 pip install imageio-ffmpeg
@@ -42,7 +48,18 @@ python extract_audio.py *.mp4 -d ./output      # 批量处理
 | `-d` | 输出目录（批量模式） |
 | `-o` | 输出文件路径（单文件模式） |
 
+## 项目结构
+
+| 文件 | 说明 |
+|------|------|
+| `extract_audio_gui.py` | 图形界面主程序 |
+| `extract_audio.py` | 命令行主程序 |
+| `audio_utils.py` | 共享模块（ffmpeg 发现、编码器映射） |
+| `启动提取工具.bat` | Windows 启动脚本 |
+| `build_exe.bat` | PyInstaller 打包脚本 |
+
 ## 依赖
 
 - Python 3.8+
 - `imageio-ffmpeg`（启动脚本会自动安装）
+- `pyinstaller`（仅打包时需要）
